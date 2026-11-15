@@ -1,0 +1,5 @@
+-keep class androidx.work.** { *; }
+-keep class androidx.work.impl.** { *; }
+-keep class androidx.work.impl.WorkDatabase_Impl { *; }
+-dontwarn androidx.work.**
+-dontwarn androidx.startup.**

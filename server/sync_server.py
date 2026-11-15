@@ -1,0 +1,1920 @@
+"""
+Dostępność Sal - FastAPI Backend Server (Kontrakt v0.1)
+Politechnika Rzeszowska
+"""
+
+import os
+import sys
+import json
+import uuid
+import hmac
+import time
+import socket
+import sqlite3
+import asyncio
+import hashlib
+import secrets
+import threading
+import platform
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict, Any
+
+from fastapi import (
+    FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException,
+    Header, Request, status
+)
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
+
+# Configuration
+PORT = int(os.environ.get("PORT", 8081))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+WEB_DIR = os.path.join(PROJECT_ROOT, "build", "web")
+DB_PATH = os.path.join(BASE_DIR, "rooms_backend.db")
+SECRET_KEY = os.environ.get("SERVER_SECRET_KEY", "dostepnosc-sal-secret-key-2026")
+SERVER_START_TIME = datetime.now(timezone.utc)
+APP_VERSION_FILE = os.path.join(BASE_DIR, "app_version.json")
+
+def _load_app_version() -> dict:
+    """Load app version metadata from app_version.json.
+    Falls back to hardcoded defaults if file is missing or malformed.
+    Uses utf-8-sig encoding to tolerate BOM written by PowerShell/Windows tools.
+    """
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            if os.path.exists(APP_VERSION_FILE):
+                with open(APP_VERSION_FILE, encoding=enc) as f:
+                    data = json.load(f)
+                if "versionCode" in data and "versionName" in data:
+                    return data
+        except Exception:
+            continue
+    # Hardcoded fallback — will be overwritten by deploy_apk.py on each build
+    return {
+        "versionCode": 8,
+        "versionName": "1.3.3",
+        "releaseNotes": "Nowa wersja jest dostępna.",
+        "apkUrl": None,
+        "apkSize": None,
+    }
+
+# Utility functions
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def parse_iso(ts_str: str) -> datetime:
+    if ts_str.endswith("Z"):
+        ts_str = ts_str[:-1] + "+00:00"
+    return datetime.fromisoformat(ts_str)
+
+def hash_password(password: str, salt: Optional[str] = None) -> str:
+    if not salt:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
+    return f"{salt}:{hashed.hex()}"
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, expected_hex = stored_hash.split(":")
+        check_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000).hex()
+        return hmac.compare_digest(check_hash, expected_hex)
+    except Exception:
+        return False
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def get_primary_lan_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+# Database Connection
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def get_db_direct():
+    conn = sqlite3.connect(DB_PATH, timeout=10.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+# Database Initialization & Migration
+INITIAL_ROOMS = [
+    {"number": "104", "name": "Gwiezdne Wojny", "floor": "Piętro", "category": "EXTRAS", "description": "Pokazy tematyczne Star Wars i robotyki kosmicznej", "capacity": 25, "posX": 70.0, "posY": 60.0},
+    {"number": "AULA", "name": "Aula Wykładowa", "floor": "Piętro", "category": "Wykładowa", "description": "Wykłady i pokazy naukowe", "capacity": 150, "posX": 200.0, "posY": 60.0},
+    {"number": "112", "name": "Druk 3D", "floor": "Piętro", "category": "Laboratorium", "description": "Warsztaty druku 3D", "capacity": 20, "posX": 70.0, "posY": 160.0},
+    {"number": "113", "name": "Zabawa światłem", "floor": "Piętro", "category": "Laboratorium", "description": "Optyka i lasery", "capacity": 20, "posX": 200.0, "posY": 160.0},
+    {"number": "115", "name": "Projektowanie CAD", "floor": "Piętro", "category": "Laboratorium", "description": "Inżynieria komputerowa", "capacity": 25, "posX": 70.0, "posY": 240.0},
+    {"number": "116", "name": "Chemiczne czary", "floor": "Piętro", "category": "Laboratorium", "description": "Eksperymenty chemiczne", "capacity": 25, "posX": 200.0, "posY": 240.0},
+    {"number": "117", "name": "Elektronika", "floor": "Piętro", "category": "Laboratorium", "description": "Lutowanie i układy", "capacity": 20, "posX": 70.0, "posY": 320.0},
+    {"number": "118", "name": "Gry internetowe", "floor": "Piętro", "category": "Laboratorium", "description": "Stanowiska sieciowe", "capacity": 25, "posX": 200.0, "posY": 320.0},
+    {"number": "120", "name": "Robota czy roboty?", "floor": "Piętro", "category": "Laboratorium", "description": "Roboty przemysłowe", "capacity": 20, "posX": 70.0, "posY": 400.0},
+    {"number": "122", "name": "Latać każdy może", "floor": "Piętro", "category": "Laboratorium", "description": "Symulatory lotu", "capacity": 25, "posX": 200.0, "posY": 400.0},
+    {"number": "9", "name": "Bryłki bez kleju", "floor": "Parter", "category": "EXTRAS", "description": "Warsztaty origami i brył", "capacity": 30, "posX": 70.0, "posY": 100.0},
+    {"number": "12", "name": "Zagraj w piłkarzyki", "floor": "Parter", "category": "EXTRAS", "description": "Strefa rekreacyjna", "capacity": 20, "posX": 195.0, "posY": 250.0},
+    {"number": "14", "name": "Wirtualny świat", "floor": "Parter", "category": "Laboratorium", "description": "Gogle VR", "capacity": 15, "posX": 195.0, "posY": 195.0},
+    {"number": "HOL", "name": "Piasek kinetyczny", "floor": "Parter", "category": "EXTRAS", "description": "Strefa wejściowa", "capacity": 80, "posX": 70.0, "posY": 220.0},
+    {"number": "Garaż", "name": "Wystawa pojazdów zabytkowych", "floor": "Garaż podziemny", "category": "Wystawa", "description": "Ekspozycja zabytkowych aut", "capacity": 100, "posX": 65.0, "posY": 325.0}
+]
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = get_db_direct()
+    cursor = conn.cursor()
+
+    # 1. System Settings
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    cursor.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('default_alert_limit_seconds', '900')")
+    cursor.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES ('max_alert_limit_seconds', '7200')")
+
+    # 2. Check for migration from legacy rooms table
+    cursor.execute("PRAGMA table_info(rooms)")
+    cols = {row["name"]: row["type"] for row in cursor.fetchall()}
+    if "isAvailable" in cols:
+        print("[DB] Migrating legacy rooms table to contract v0.1 schema...")
+        cursor.execute("SELECT * FROM rooms")
+        old_rooms = cursor.fetchall()
+        cursor.execute("DROP TABLE rooms")
+        cursor.execute("""
+            CREATE TABLE rooms (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                location TEXT,
+                floor TEXT NOT NULL,
+                operator_id TEXT,
+                default_alert_limit_seconds INTEGER,
+                status TEXT NOT NULL DEFAULT 'free' CHECK(status IN ('free', 'occupied')),
+                device_id TEXT,
+                category TEXT DEFAULT 'Laboratorium',
+                description TEXT DEFAULT '',
+                capacity INTEGER DEFAULT 30,
+                customNote TEXT DEFAULT '',
+                posX REAL,
+                posY REAL,
+                sortOrder INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        now = utc_now()
+        for idx, r in enumerate(old_rooms):
+            r_id = r["number"]
+            st = "free" if r["isAvailable"] == 1 else "occupied"
+            cursor.execute("""
+                INSERT INTO rooms (id, name, location, floor, default_alert_limit_seconds, status, category, description, capacity, customNote, posX, posY, sortOrder, created_at, updated_at)
+                VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r_id, r["name"], f"Poziom {r['floor']}", r["floor"],
+                st, r["category"], r["description"], r["capacity"],
+                r["customNote"] or "", r["posX"], r["posY"], r["sortOrder"] or idx,
+                r["updatedAt"] or now, r["updatedAt"] or now
+            ))
+        conn.commit()
+        print("[DB] Rooms migrated successfully.")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS rooms (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            location TEXT,
+            floor TEXT NOT NULL,
+            operator_id TEXT,
+            default_alert_limit_seconds INTEGER,
+            status TEXT NOT NULL DEFAULT 'free' CHECK(status IN ('free', 'occupied')),
+            device_id TEXT,
+            category TEXT DEFAULT 'Laboratorium',
+            description TEXT DEFAULT '',
+            capacity INTEGER DEFAULT 30,
+            customNote TEXT DEFAULT '',
+            posX REAL,
+            posY REAL,
+            sortOrder INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    # 3. Users
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin', 'operator')),
+            room_id TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE SET NULL
+        )
+    """)
+
+    # 4. Devices (ESP8266)
+    cursor.execute("PRAGMA table_info(devices)")
+    dev_cols = {row["name"] for row in cursor.fetchall()}
+    if dev_cols and "id" not in dev_cols:
+        print("[DB] Migrating legacy devices table to contract schema...")
+        cursor.execute("DROP TABLE devices")
+        conn.commit()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS devices (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            room_id TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            last_seen_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE SET NULL
+        )
+    """)
+    cursor.execute("PRAGMA table_info(devices)")
+    dev_cols = {row["name"] for row in cursor.fetchall()}
+    if "firmware_version" not in dev_cols:
+        cursor.execute("ALTER TABLE devices ADD COLUMN firmware_version TEXT DEFAULT '1.0.0'")
+    if "chip_type" not in dev_cols:
+        cursor.execute("ALTER TABLE devices ADD COLUMN chip_type TEXT DEFAULT 'esp32'")
+
+    # 5. Occupancy Sessions
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS occupancy_sessions (
+            id TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            alert_limit_seconds INTEGER NOT NULL,
+            alert_due_at TEXT NOT NULL,
+            alert_triggered_at TEXT,
+            started_by TEXT NOT NULL,
+            ended_by TEXT,
+            FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE
+        )
+    """)
+    # Enforce only one active session per room:
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_active_session_per_room
+        ON occupancy_sessions(room_id) WHERE ended_at IS NULL
+    """)
+
+    # 6. Alerts
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id TEXT PRIMARY KEY,
+            room_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            triggered_at TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'occupancy_limit_exceeded',
+            FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
+            FOREIGN KEY (session_id) REFERENCES occupancy_sessions(id) ON DELETE CASCADE,
+            UNIQUE(session_id, type)
+        )
+    """)
+
+    # 7. Audit Logs
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            actor_type TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            details TEXT
+        )
+    """)
+
+    # 8. User Auth Tokens
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS auth_tokens (
+            token TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+
+    conn.commit()
+
+    # Seed Initial Rooms if empty
+    cursor.execute("SELECT COUNT(*) FROM rooms")
+    if cursor.fetchone()[0] == 0:
+        now = utc_now()
+        for idx, r in enumerate(INITIAL_ROOMS):
+            r_id = r["number"]
+            cursor.execute("""
+                INSERT INTO rooms (id, name, location, floor, default_alert_limit_seconds, status, category, description, capacity, posX, posY, sortOrder, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'free', ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r_id, r["name"], f"Poziom {r['floor']}", r["floor"],
+                None, r["category"], r["description"], r["capacity"],
+                r.get("posX"), r.get("posY"), idx, now, now
+            ))
+        conn.commit()
+        print(f"[DB] Seeded {len(INITIAL_ROOMS)} initial rooms.")
+
+    # Seed Default Administrator if no users
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] == 0:
+        now = utc_now()
+        admin_pass = hash_password("admin123")
+        cursor.execute("""
+            INSERT INTO users (id, username, password_hash, display_name, role, room_id, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+        """, (str(uuid.uuid4()), "admin", admin_pass, "Główny Administrator", "admin", None, now, now))
+
+        # Seed Sample Operators for testing
+        op_pass = hash_password("operator123")
+        for room_no in ["104", "AULA", "Garaż"]:
+            cursor.execute("""
+                INSERT INTO users (id, username, password_hash, display_name, role, room_id, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """, (str(uuid.uuid4()), f"operator_{room_no.lower()}", op_pass, f"Operator Sali {room_no}", "operator", room_no, now, now))
+        conn.commit()
+        print("[DB] Seeded default administrator (admin / admin123) and sample operators.")
+
+    # Seed Default Hardware Devices if not present
+    cursor.execute("SELECT COUNT(*) FROM devices WHERE token_hash = ?", (hash_token("dev_token_sala104"),))
+    if cursor.fetchone()[0] == 0:
+        now = utc_now()
+        default_devices = [
+            ("dev_token_sala104", "CYD_ESP32_Sala_104", "104"),
+            ("dev_token_sala112", "ESP_Sala_112", "112"),
+            ("dev_token_sala_aula", "ESP_Sala_AULA", "AULA"),
+            ("dev_token_sala_garaz", "ESP_Sala_Garaz", "Garaż"),
+        ]
+        for token, name, r_id in default_devices:
+            dev_id = str(uuid.uuid4())
+            token_h = hash_token(token)
+            cursor.execute("""
+                INSERT INTO devices (id, name, token_hash, room_id, is_active, last_seen_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+            """, (dev_id, name, token_h, r_id, now, now, now))
+            cursor.execute("UPDATE rooms SET device_id = ? WHERE id = ?", (dev_id, r_id))
+        conn.commit()
+        print("[DB] Seeded default hardware controller tokens.")
+
+    conn.close()
+
+# In-Memory WebSocket Manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, event_type: str, data: Any):
+        payload = {
+            "type": event_type,
+            "occurred_at": utc_now(),
+            "data": data
+        }
+        dead_connections = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(json.dumps(payload))
+            except Exception:
+                dead_connections.append(connection)
+        for dc in dead_connections:
+            self.disconnect(dc)
+
+ws_manager = ConnectionManager()
+
+# FastAPI App
+app = FastAPI(
+    title="DostępnośćSal API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/api/v1/openapi.json"
+)
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Standardized Error Response Exception
+class DomainException(HTTPException):
+    def __init__(self, status_code: int, code: str, message: str, details: Optional[Dict[str, Any]] = None):
+        super().__init__(status_code=status_code, detail={"code": code, "message": message, "details": details or {}})
+
+@app.exception_handler(DomainException)
+async def domain_exception_handler(request: Request, exc: DomainException):
+    req_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.detail.get("code", "ERROR"),
+                "message": exc.detail.get("message", ""),
+                "details": exc.detail.get("details", {}),
+                "request_id": req_id
+            }
+        }
+    )
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request.state.request_id = str(uuid.uuid4())
+    response = await call_next(request)
+    return response
+
+# Dependency: Authentication
+def get_current_user_optional(authorization: Optional[str] = Header(None), db: sqlite3.Connection = Depends(get_db)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ")[1]
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT u.* FROM auth_tokens t
+        JOIN users u ON t.user_id = u.id
+        WHERE t.token = ? AND t.expires_at > ? AND u.is_active = 1
+    """, (token, utc_now()))
+    user = cursor.fetchone()
+    return user
+
+def require_current_user(user: Optional[sqlite3.Row] = Depends(get_current_user_optional)):
+    if not user:
+        raise DomainException(401, "UNAUTHENTICATED", "Wymagane uwierzytelnienie.")
+    return user
+
+def require_admin(user: sqlite3.Row = Depends(require_current_user)):
+    if user["role"] != "admin":
+        raise DomainException(403, "FORBIDDEN", "Brak uprawnień administratora.")
+    return user
+
+def get_current_device_optional(
+    authorization: Optional[str] = Header(None),
+    x_device_token: Optional[str] = Header(None),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    token = None
+    if x_device_token:
+        token = x_device_token
+    elif authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+    
+    if not token:
+        return None
+    
+    token_h = hash_token(token)
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM devices WHERE token_hash = ? AND is_active = 1", (token_h,))
+    return cursor.fetchone()
+
+def require_device(device: Optional[sqlite3.Row] = Depends(get_current_device_optional)):
+    if not device:
+        raise DomainException(401, "UNAUTHENTICATED", "Niepoprawny lub nieaktywny token urządzenia ESP.")
+    return device
+
+# Audit Logging Helper
+def log_audit(db: sqlite3.Connection, actor_type: str, actor_id: str, action: str, res_type: str, res_id: str, details: Optional[Dict] = None):
+    cursor = db.cursor()
+    cursor.execute("""
+        INSERT INTO audit_logs (id, created_at, actor_type, actor_id, action, resource_type, resource_id, details)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(uuid.uuid4()), utc_now(), actor_type, actor_id, action, res_type, res_id,
+        json.dumps(details or {}, ensure_ascii=False)
+    ))
+    db.commit()
+
+# Active Session Formatter
+def format_active_session(session_row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if not session_row:
+        return None
+    
+    started_at = session_row["started_at"]
+    alert_due_at = session_row["alert_due_at"]
+    now_dt = datetime.now(timezone.utc)
+    started_dt = parse_iso(started_at)
+    due_dt = parse_iso(alert_due_at)
+    
+    duration_sec = max(0, int((now_dt - started_dt).total_seconds()))
+    is_alert_due = now_dt >= due_dt
+
+    return {
+        "id": session_row["id"],
+        "room_id": session_row["room_id"],
+        "started_at": started_at,
+        "duration_seconds": duration_sec,
+        "alert_limit_seconds": session_row["alert_limit_seconds"],
+        "alert_due_at": alert_due_at,
+        "alert_triggered_at": session_row["alert_triggered_at"],
+        "alert_due": is_alert_due
+    }
+
+# Background Alert Checker Loop
+async def alert_monitor_loop():
+    while True:
+        try:
+            await asyncio.sleep(2)
+            conn = get_db_direct()
+            cursor = conn.cursor()
+            now_iso = utc_now()
+            now_dt = parse_iso(now_iso)
+
+            cursor.execute("""
+                SELECT s.*, r.name as room_name FROM occupancy_sessions s
+                JOIN rooms r ON s.room_id = r.id
+                WHERE s.ended_at IS NULL AND s.alert_triggered_at IS NULL
+            """)
+            active_sessions = cursor.fetchall()
+
+            for sess in active_sessions:
+                due_dt = parse_iso(sess["alert_due_at"])
+                if now_dt >= due_dt:
+                    alert_id = str(uuid.uuid4())
+                    # Insert alert with UNIQUE constraint protection
+                    try:
+                        cursor.execute("""
+                            INSERT INTO alerts (id, room_id, session_id, triggered_at, type)
+                            VALUES (?, ?, ?, ?, 'occupancy_limit_exceeded')
+                        """, (alert_id, sess["room_id"], sess["id"], now_iso))
+                        
+                        cursor.execute("""
+                            UPDATE occupancy_sessions SET alert_triggered_at = ? WHERE id = ?
+                        """, (now_iso, sess["id"]))
+                        conn.commit()
+
+                        # Audit log
+                        log_audit(conn, "system", "alert_engine", "alert_triggered", "alert", alert_id, {
+                            "room_id": sess["room_id"],
+                            "session_id": sess["id"],
+                            "alert_limit_seconds": sess["alert_limit_seconds"]
+                        })
+
+                        # Broadcast Alert Created
+                        await ws_manager.broadcast("alert.created", {
+                            "id": alert_id,
+                            "room_id": sess["room_id"],
+                            "session_id": sess["id"],
+                            "triggered_at": now_iso,
+                            "type": "occupancy_limit_exceeded"
+                        })
+
+                        # Broadcast Room Updated (status is still occupied, but alert_due is now true)
+                        cursor.execute("SELECT * FROM occupancy_sessions WHERE id = ?", (sess["id"],))
+                        upd_sess = cursor.fetchone()
+                        await ws_manager.broadcast("room.updated", {
+                            "room_id": sess["room_id"],
+                            "status": "occupied",
+                            "active_session": format_active_session(upd_sess)
+                        })
+                    except sqlite3.IntegrityError:
+                        pass # Alert already registered for this session
+            conn.close()
+        except Exception as e:
+            sys.stderr.write(f"[Alert Monitor] Error: {e}\n")
+
+# Start Alert Monitor Background Task
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    asyncio.create_task(alert_monitor_loop())
+
+# ==============================================================================
+# 6.1 Publiczny podgląd sal
+# ==============================================================================
+@app.get("/api/v1/public/rooms", tags=["Public"])
+def get_public_rooms(floor: Optional[str] = None, db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    query = """
+        SELECT r.*, 
+               s.id as s_id, s.started_at as s_started_at, s.alert_limit_seconds as s_limit, 
+               s.alert_due_at as s_due_at, s.alert_triggered_at as s_triggered_at
+        FROM rooms r
+        LEFT JOIN occupancy_sessions s ON r.id = s.room_id AND s.ended_at IS NULL
+    """
+    params = []
+    if floor and floor.lower() != "wszystkie":
+        if floor.lower() == "parter":
+            # Including Garage on Parter as required by building layout
+            query += " WHERE (LOWER(r.floor) = 'parter' OR LOWER(r.floor) LIKE '%gara%')"
+        else:
+            query += " WHERE LOWER(r.floor) = ?"
+            params.append(floor.lower())
+    query += " ORDER BY r.sortOrder ASC, r.id ASC"
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    
+    result = []
+    for r in rows:
+        session_data = None
+        if r["s_id"]:
+            session_data = format_active_session({
+                "id": r["s_id"],
+                "room_id": r["id"],
+                "started_at": r["s_started_at"],
+                "alert_limit_seconds": r["s_limit"],
+                "alert_due_at": r["s_due_at"],
+                "alert_triggered_at": r["s_triggered_at"]
+            })
+        
+        result.append({
+            "id": r["id"],
+            "name": r["name"],
+            "location": r["location"] or f"Poziom {r['floor']}",
+            "floor": r["floor"],
+            "status": r["status"],
+            "category": r["category"],
+            "description": r["description"],
+            "capacity": r["capacity"],
+            "customNote": r["customNote"],
+            "posX": r["posX"],
+            "posY": r["posY"],
+            "default_alert_limit_seconds": r["default_alert_limit_seconds"],
+            "active_session": session_data,
+            "updated_at": r["updated_at"]
+        })
+    return result
+
+@app.get("/api/v1/public/rooms/{room_id}", tags=["Public"])
+def get_public_room(room_id: str, db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT r.*, 
+               s.id as s_id, s.started_at as s_started_at, s.alert_limit_seconds as s_limit, 
+               s.alert_due_at as s_due_at, s.alert_triggered_at as s_triggered_at
+        FROM rooms r
+        LEFT JOIN occupancy_sessions s ON r.id = s.room_id AND s.ended_at IS NULL
+        WHERE r.id = ?
+    """, (room_id,))
+    r = cursor.fetchone()
+    if not r:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Sala nie istnieje.")
+    
+    session_data = None
+    if r["s_id"]:
+        session_data = format_active_session({
+            "id": r["s_id"],
+            "room_id": r["id"],
+            "started_at": r["s_started_at"],
+            "alert_limit_seconds": r["s_limit"],
+            "alert_due_at": r["s_due_at"],
+            "alert_triggered_at": r["s_triggered_at"]
+        })
+
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "location": r["location"],
+        "floor": r["floor"],
+        "status": r["status"],
+        "category": r["category"],
+        "description": r["description"],
+        "capacity": r["capacity"],
+        "customNote": r["customNote"],
+        "posX": r["posX"],
+        "posY": r["posY"],
+        "default_alert_limit_seconds": r["default_alert_limit_seconds"],
+        "active_session": session_data,
+        "updated_at": r["updated_at"]
+    }
+
+# ==============================================================================
+# 6.2 Uwierzytelnianie kont
+# ==============================================================================
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/v1/auth/login", tags=["Auth"])
+def login(req: LoginRequest, db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (req.username.strip(),))
+    user = cursor.fetchone()
+    
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise DomainException(401, "UNAUTHENTICATED", "Niepoprawny login lub hasło.")
+    
+    token = secrets.token_urlsafe(32)
+    now_dt = datetime.now(timezone.utc)
+    expires_dt = now_dt + timedelta(days=7)
+    
+    cursor.execute("""
+        INSERT INTO auth_tokens (token, user_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+    """, (token, user["id"], utc_now(), expires_dt.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    db.commit()
+
+    log_audit(db, "user", user["id"], "user_logged_in", "user", user["id"])
+
+    return {
+        "access_token": token,
+        "token": token,
+        "token_type": "Bearer",
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "display_name": user["display_name"],
+            "role": user["role"],
+            "room_id": user["room_id"]
+        }
+    }
+
+@app.post("/api/v1/auth/logout", tags=["Auth"])
+def logout(authorization: Optional[str] = Header(None), db: sqlite3.Connection = Depends(get_db)):
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM auth_tokens WHERE token = ?", (token,))
+        db.commit()
+    return {"status": "success", "message": "Wylogowano pomyślnie."}
+
+@app.post("/api/v1/auth/refresh", tags=["Auth"])
+def refresh_token(authorization: Optional[str] = Header(None), db: sqlite3.Connection = Depends(get_db)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise DomainException(401, "UNAUTHENTICATED", "Brak tokena do odświeżenia.")
+    token = authorization.split(" ")[1]
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT a.*, u.id as u_id, u.username, u.display_name, u.role, u.room_id
+        FROM auth_tokens a
+        JOIN users u ON a.user_id = u.id
+        WHERE a.token = ? AND a.expires_at > ? AND u.is_active = 1
+    """, (token, utc_now()))
+    row = cursor.fetchone()
+    if not row:
+        raise DomainException(401, "UNAUTHENTICATED", "Token wygasł lub jest nieprawidłowy.")
+    
+    new_token = secrets.token_urlsafe(32)
+    now_dt = datetime.now(timezone.utc)
+    expires_dt = now_dt + timedelta(days=7)
+    cursor.execute("DELETE FROM auth_tokens WHERE token = ?", (token,))
+    cursor.execute("""
+        INSERT INTO auth_tokens (token, user_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+    """, (new_token, row["u_id"], utc_now(), expires_dt.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    db.commit()
+    return {
+        "access_token": new_token,
+        "token": new_token,
+        "token_type": "Bearer",
+        "user": {
+            "id": row["u_id"],
+            "username": row["username"],
+            "display_name": row["display_name"],
+            "role": row["role"],
+            "room_id": row["room_id"]
+        }
+    }
+
+@app.get("/api/v1/auth/me", tags=["Auth"])
+def get_me(user: sqlite3.Row = Depends(require_current_user)):
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "display_name": user["display_name"],
+        "role": user["role"],
+        "room_id": user["room_id"],
+        "is_active": bool(user["is_active"])
+    }
+
+# ==============================================================================
+# 6.3 Sale i Status (Zalogowani / Operator / Admin)
+# ==============================================================================
+class StatusChangeRequest(BaseModel):
+    status: str = Field(..., pattern="^(free|occupied)$")
+
+@app.get("/api/v1/rooms", tags=["Rooms"])
+def get_rooms_detailed(user: sqlite3.Row = Depends(require_current_user), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    query = """
+        SELECT r.*, 
+               s.id as s_id, s.started_at as s_started_at, s.alert_limit_seconds as s_limit, 
+               s.alert_due_at as s_due_at, s.alert_triggered_at as s_triggered_at
+        FROM rooms r
+        LEFT JOIN occupancy_sessions s ON r.id = s.room_id AND s.ended_at IS NULL
+    """
+    params = []
+    # Operator sees only assigned room
+    if user["role"] == "operator":
+        if not user["room_id"]:
+            return []
+        query += " WHERE r.id = ?"
+        params.append(user["room_id"])
+    query += " ORDER BY r.sortOrder ASC, r.id ASC"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+
+    result = []
+    for r in rows:
+        session_data = None
+        if r["s_id"]:
+            session_data = format_active_session({
+                "id": r["s_id"],
+                "room_id": r["id"],
+                "started_at": r["s_started_at"],
+                "alert_limit_seconds": r["s_limit"],
+                "alert_due_at": r["s_due_at"],
+                "alert_triggered_at": r["s_triggered_at"]
+            })
+        
+        result.append({
+            "id": r["id"],
+            "name": r["name"],
+            "location": r["location"],
+            "floor": r["floor"],
+            "operator_id": r["operator_id"],
+            "device_id": r["device_id"] if user["role"] == "admin" else None,
+            "default_alert_limit_seconds": r["default_alert_limit_seconds"],
+            "status": r["status"],
+            "category": r["category"],
+            "description": r["description"],
+            "capacity": r["capacity"],
+            "customNote": r["customNote"],
+            "posX": r["posX"],
+            "posY": r["posY"],
+            "active_session": session_data,
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"]
+        })
+    return result
+
+@app.get("/api/v1/rooms/{room_id}", tags=["Rooms"])
+def get_room_detailed(room_id: str, user: sqlite3.Row = Depends(require_current_user), db: sqlite3.Connection = Depends(get_db)):
+    if user["role"] == "operator" and user["room_id"] != room_id:
+        raise DomainException(403, "FORBIDDEN", "Brak uprawnień do przeglądania tej sali.")
+    
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT r.*, 
+               s.id as s_id, s.started_at as s_started_at, s.alert_limit_seconds as s_limit, 
+               s.alert_due_at as s_due_at, s.alert_triggered_at as s_triggered_at
+        FROM rooms r
+        LEFT JOIN occupancy_sessions s ON r.id = s.room_id AND s.ended_at IS NULL
+        WHERE r.id = ?
+    """, (room_id,))
+    r = cursor.fetchone()
+    if not r:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Sala nie została znaleziona.")
+    
+    session_data = None
+    if r["s_id"]:
+        session_data = format_active_session({
+            "id": r["s_id"],
+            "room_id": r["id"],
+            "started_at": r["s_started_at"],
+            "alert_limit_seconds": r["s_limit"],
+            "alert_due_at": r["s_due_at"],
+            "alert_triggered_at": r["s_triggered_at"]
+        })
+
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "location": r["location"],
+        "floor": r["floor"],
+        "operator_id": r["operator_id"],
+        "device_id": r["device_id"] if user["role"] == "admin" else None,
+        "default_alert_limit_seconds": r["default_alert_limit_seconds"],
+        "status": r["status"],
+        "category": r["category"],
+        "description": r["description"],
+        "capacity": r["capacity"],
+        "customNote": r["customNote"],
+        "posX": r["posX"],
+        "posY": r["posY"],
+        "default_alert_limit_seconds": r["default_alert_limit_seconds"],
+        "active_session": session_data,
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"]
+    }
+
+@app.patch("/api/v1/rooms/{room_id}/status", tags=["Rooms"])
+@app.post("/api/v1/rooms/{room_id}/status", tags=["Rooms"])
+async def change_room_status(
+    room_id: str,
+    req: StatusChangeRequest,
+    user: Optional[sqlite3.Row] = Depends(get_current_user_optional),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    if user and user["role"] == "operator" and user["room_id"] != room_id:
+        raise DomainException(403, "FORBIDDEN", "Operator może zarządzać wyłącznie swoją przypisaną salą.")
+
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM rooms WHERE id = ?", (room_id,))
+    room = cursor.fetchone()
+    if not room:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Sala nie istnieje.")
+
+    target_status = req.status
+    current_status = room["status"]
+    now_iso = utc_now()
+    now_dt = parse_iso(now_iso)
+    changed = False
+
+    cursor.execute("SELECT * FROM occupancy_sessions WHERE room_id = ? AND ended_at IS NULL", (room_id,))
+    active_session = cursor.fetchone()
+
+    actor_type = "user" if user else "guest"
+    actor_id = user["id"] if user else "guest:web"
+    actor_str = f"user:{user['id']}" if user else "guest:web"
+
+    if current_status == "free" and target_status == "occupied":
+        # Determine effective alert limit
+        effective_limit = room["default_alert_limit_seconds"]
+        if not effective_limit:
+            cursor.execute("SELECT value FROM system_settings WHERE key = 'default_alert_limit_seconds'")
+            row = cursor.fetchone()
+            effective_limit = int(row["value"]) if row else 900
+        
+        due_dt = now_dt + timedelta(seconds=effective_limit)
+        due_iso = due_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        session_id = str(uuid.uuid4())
+
+        cursor.execute("""
+            INSERT INTO occupancy_sessions (id, room_id, started_at, ended_at, alert_limit_seconds, alert_due_at, alert_triggered_at, started_by, ended_by)
+            VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, NULL)
+        """, (session_id, room_id, now_iso, effective_limit, due_iso, actor_str))
+
+        cursor.execute("UPDATE rooms SET status = 'occupied', updated_at = ? WHERE id = ?", (now_iso, room_id))
+        db.commit()
+        changed = True
+
+        cursor.execute("SELECT * FROM occupancy_sessions WHERE id = ?", (session_id,))
+        active_session = cursor.fetchone()
+        log_audit(db, actor_type, actor_id, "session_started", "room", room_id, {"session_id": session_id, "limit": effective_limit})
+
+    elif current_status == "occupied" and target_status == "free":
+        if active_session:
+            cursor.execute("UPDATE occupancy_sessions SET ended_at = ?, ended_by = ? WHERE id = ?", (now_iso, actor_str, active_session["id"]))
+        
+        cursor.execute("UPDATE rooms SET status = 'free', updated_at = ? WHERE id = ?", (now_iso, room_id))
+        db.commit()
+        changed = True
+        log_audit(db, actor_type, actor_id, "session_ended", "room", room_id, {"session_id": active_session["id"] if active_session else None})
+        active_session = None
+
+    # Broadcast event if changed
+    formatted_session = format_active_session(active_session)
+    if changed:
+        await ws_manager.broadcast("room.updated", {
+            "room_id": room_id,
+            "status": target_status,
+            "active_session": formatted_session
+        })
+
+    return {
+        "data": {
+            "room_id": room_id,
+            "status": target_status,
+            "changed": changed,
+            "active_session": formatted_session
+        },
+        "meta": {
+            "server_time": now_iso
+        }
+    }
+
+@app.get("/api/v1/rooms/{room_id}/sessions", tags=["Rooms"])
+def get_room_sessions(room_id: str, user: sqlite3.Row = Depends(require_current_user), db: sqlite3.Connection = Depends(get_db)):
+    if user["role"] == "operator" and user["room_id"] != room_id:
+        raise DomainException(403, "FORBIDDEN", "Brak uprawnień do przeglądania historii tej sali.")
+    
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM occupancy_sessions WHERE room_id = ? ORDER BY started_at DESC LIMIT 50", (room_id,))
+    rows = cursor.fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/api/v1/rooms/{room_id}/alerts", tags=["Rooms"])
+def get_room_alerts(room_id: str, user: sqlite3.Row = Depends(require_current_user), db: sqlite3.Connection = Depends(get_db)):
+    if user["role"] == "operator" and user["room_id"] != room_id:
+        raise DomainException(403, "FORBIDDEN", "Brak uprawnień.")
+    
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM alerts WHERE room_id = ? ORDER BY triggered_at DESC LIMIT 50", (room_id,))
+    rows = cursor.fetchall()
+    return [dict(r) for r in rows]
+
+# ==============================================================================
+# 6.4 Limity i Ustawienia
+# ==============================================================================
+class AlertLimitChangeRequest(BaseModel):
+    alert_limit_seconds: Optional[int] = Field(None, ge=1)
+    limit_seconds: Optional[int] = None
+
+@app.patch("/api/v1/rooms/{room_id}/alert-limit", tags=["Limits"])
+@app.post("/api/v1/rooms/{room_id}/alert-limit", tags=["Limits"])
+async def update_room_default_limit(
+    room_id: str,
+    req: AlertLimitChangeRequest,
+    user: Optional[sqlite3.Row] = Depends(get_current_user_optional),
+    device: Optional[sqlite3.Row] = Depends(get_current_device_optional),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    if user and user["role"] == "operator" and user["room_id"] != room_id:
+        raise DomainException(403, "FORBIDDEN", "Operator może zmieniać limit wyłącznie swojej sali.")
+
+    limit_val = req.alert_limit_seconds or req.limit_seconds
+    if not limit_val or limit_val <= 0:
+        raise DomainException(400, "VALIDATION_ERROR", "Niepoprawna wartość alert_limit_seconds.")
+
+    cursor = db.cursor()
+    cursor.execute("SELECT value FROM system_settings WHERE key = 'max_alert_limit_seconds'")
+    max_limit = int(cursor.fetchone()["value"])
+
+    if limit_val > max_limit:
+        raise DomainException(400, "ALERT_LIMIT_EXCEEDS_MAXIMUM", f"Limit przekracza maksymalną wartość ({max_limit} s).", {"maximum_seconds": max_limit})
+
+    now_iso = utc_now()
+    cursor.execute("UPDATE rooms SET default_alert_limit_seconds = ?, updated_at = ? WHERE id = ?", (limit_val, now_iso, room_id))
+
+    # Natychmiast zaktualizuj także trwającą sesję dla tej sali
+    cursor.execute("SELECT * FROM occupancy_sessions WHERE room_id = ? AND ended_at IS NULL", (room_id,))
+    active_session = cursor.fetchone()
+    if active_session:
+        started_dt = parse_iso(active_session["started_at"])
+        due_dt = started_dt + timedelta(seconds=limit_val)
+        due_iso = due_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cursor.execute("UPDATE occupancy_sessions SET alert_limit_seconds = ?, alert_due_at = ? WHERE id = ?", (limit_val, due_iso, active_session["id"]))
+        cursor.execute("SELECT * FROM occupancy_sessions WHERE id = ?", (active_session["id"],))
+        active_session = cursor.fetchone()
+
+    db.commit()
+    actor_id = user["id"] if user else (device["id"] if device else "public_client")
+    log_audit(db, "user" if user else "system", actor_id, "room_default_limit_changed", "room", room_id, {"new_limit": limit_val})
+
+    formatted_session = format_active_session(active_session)
+    await ws_manager.broadcast("room.updated", {
+        "room_id": room_id,
+        "default_alert_limit_seconds": limit_val,
+        "active_session": formatted_session
+    })
+
+    return {
+        "status": "success",
+        "room_id": room_id,
+        "default_alert_limit_seconds": limit_val,
+        "active_session": formatted_session
+    }
+
+@app.patch("/api/v1/sessions/{session_id}/alert-limit", tags=["Limits"])
+async def update_active_session_limit(
+    session_id: str,
+    req: AlertLimitChangeRequest,
+    admin: sqlite3.Row = Depends(require_admin),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    if req.alert_limit_seconds is None:
+        raise DomainException(400, "VALIDATION_ERROR", "Wymagana wartość alert_limit_seconds.")
+
+    cursor = db.cursor()
+    cursor.execute("SELECT value FROM system_settings WHERE key = 'max_alert_limit_seconds'")
+    max_limit = int(cursor.fetchone()["value"])
+    if req.alert_limit_seconds > max_limit:
+        raise DomainException(400, "ALERT_LIMIT_EXCEEDS_MAXIMUM", f"Limit przekracza maksimum ({max_limit} s).", {"maximum_seconds": max_limit})
+
+    cursor.execute("SELECT * FROM occupancy_sessions WHERE id = ?", (session_id,))
+    sess = cursor.fetchone()
+    if not sess or sess["ended_at"] is not None:
+        raise DomainException(400, "SESSION_NOT_ACTIVE", "Sesja nie istnieje lub została już zakończona.")
+
+    started_dt = parse_iso(sess["started_at"])
+    new_due_dt = started_dt + timedelta(seconds=req.alert_limit_seconds)
+    new_due_iso = new_due_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    cursor.execute("UPDATE occupancy_sessions SET alert_limit_seconds = ?, alert_due_at = ? WHERE id = ?", (req.alert_limit_seconds, new_due_iso, session_id))
+    db.commit()
+
+    log_audit(db, "user", admin["id"], "session_limit_changed", "session", session_id, {"new_limit": req.alert_limit_seconds, "new_due_at": new_due_iso})
+
+    # Broadcast update
+    cursor.execute("SELECT * FROM occupancy_sessions WHERE id = ?", (session_id,))
+    upd_sess = cursor.fetchone()
+    await ws_manager.broadcast("room.updated", {
+        "room_id": sess["room_id"],
+        "status": "occupied",
+        "active_session": format_active_session(upd_sess)
+    })
+
+    return {"status": "success", "session_id": session_id, "alert_limit_seconds": req.alert_limit_seconds, "alert_due_at": new_due_iso}
+
+@app.get("/api/v1/admin/settings", tags=["Limits"])
+def get_system_settings(admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM system_settings")
+    rows = cursor.fetchall()
+    return {r["key"]: int(r["value"]) if r["value"].isdigit() else r["value"] for r in rows}
+
+class SystemSettingsUpdateRequest(BaseModel):
+    default_alert_limit_seconds: Optional[int] = Field(None, ge=1)
+    max_alert_limit_seconds: Optional[int] = Field(None, ge=1)
+
+@app.patch("/api/v1/admin/settings", tags=["Limits"])
+def update_system_settings(req: SystemSettingsUpdateRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    if req.max_alert_limit_seconds is not None:
+        cursor.execute("UPDATE system_settings SET value = ? WHERE key = 'max_alert_limit_seconds'", (str(req.max_alert_limit_seconds),))
+    if req.default_alert_limit_seconds is not None:
+        cursor.execute("UPDATE system_settings SET value = ? WHERE key = 'default_alert_limit_seconds'", (str(req.default_alert_limit_seconds),))
+    db.commit()
+    log_audit(db, "user", admin["id"], "system_settings_updated", "system", "settings", req.dict(exclude_none=True))
+    return {"status": "success", "settings": req.dict(exclude_none=True)}
+
+# ==============================================================================
+# 6.5 Administracja salami i kontami
+# ==============================================================================
+class CreateRoomRequest(BaseModel):
+    id: str
+    name: str
+    location: Optional[str] = ""
+    floor: str = "Parter"
+    category: str = "Laboratorium"
+    description: Optional[str] = ""
+    capacity: int = 30
+    posX: Optional[float] = None
+    posY: Optional[float] = None
+    default_alert_limit_seconds: Optional[int] = None
+
+@app.post("/api/v1/admin/rooms", tags=["Admin"])
+def create_room(req: CreateRoomRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM rooms WHERE id = ?", (req.id,))
+    if cursor.fetchone():
+        raise DomainException(409, "ROOM_ASSIGNMENT_CONFLICT", f"Sala o identyfikatorze '{req.id}' już istnieje.")
+    
+    now = utc_now()
+    cursor.execute("""
+        INSERT INTO rooms (id, name, location, floor, category, description, capacity, posX, posY, default_alert_limit_seconds, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'free', ?, ?)
+    """, (req.id, req.name, req.location, req.floor, req.category, req.description, req.capacity, req.posX, req.posY, req.default_alert_limit_seconds, now, now))
+    db.commit()
+    log_audit(db, "user", admin["id"], "room_created", "room", req.id)
+    return {"status": "success", "id": req.id}
+
+class UpdateRoomRequest(BaseModel):
+    name: Optional[str] = None
+    location: Optional[str] = None
+    floor: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    capacity: Optional[int] = None
+    posX: Optional[float] = None
+    posY: Optional[float] = None
+    operator_id: Optional[str] = None
+    default_alert_limit_seconds: Optional[int] = None
+
+@app.patch("/api/v1/admin/rooms/{room_id}", tags=["Admin"])
+def update_room_admin(room_id: str, req: UpdateRoomRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM rooms WHERE id = ?", (room_id,))
+    room = cursor.fetchone()
+    if not room:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Sala nie istnieje.")
+
+    fields = []
+    values = []
+    for k, v in req.dict(exclude_unset=True).items():
+        fields.append(f"{k} = ?")
+        values.append(v)
+    
+    if fields:
+        fields.append("updated_at = ?")
+        values.append(utc_now())
+        values.append(room_id)
+        cursor.execute(f"UPDATE rooms SET {', '.join(fields)} WHERE id = ?", values)
+        db.commit()
+        log_audit(db, "user", admin["id"], "room_updated", "room", room_id, req.dict(exclude_unset=True))
+    
+    return {"status": "success", "room_id": room_id}
+
+@app.delete("/api/v1/admin/rooms/{room_id}", tags=["Admin"])
+def delete_room_admin(room_id: str, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM rooms WHERE id = ?", (room_id,))
+    if not cursor.fetchone():
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Sala nie istnieje.")
+    cursor.execute("DELETE FROM rooms WHERE id = ?", (room_id,))
+    db.commit()
+    log_audit(db, "user", admin["id"], "room_deleted", "room", room_id)
+    return {"status": "success", "message": "Sala została usunięta."}
+
+class RoomPositionRequest(BaseModel):
+    posX: float
+    posY: float
+
+@app.post("/api/v1/admin/rooms/{room_id}/position", tags=["Admin"])
+async def set_room_position(room_id: str, req: RoomPositionRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM rooms WHERE id = ?", (room_id,))
+    room = cursor.fetchone()
+    if not room:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Sala nie istnieje.")
+    now = utc_now()
+    cursor.execute("UPDATE rooms SET posX = ?, posY = ?, updated_at = ? WHERE id = ?", (req.posX, req.posY, now, room_id))
+    db.commit()
+    cursor.execute("SELECT * FROM rooms WHERE id = ?", (room_id,))
+    updated = build_room_representation(cursor.fetchone(), db)
+    await broadcast_ws_event("room.updated", updated)
+    return {"status": "success", "room": updated}
+
+class ResetPositionsRequest(BaseModel):
+    floor: Optional[str] = None
+
+@app.post("/api/v1/admin/rooms/reset-positions", tags=["Admin"])
+def reset_room_positions(req: ResetPositionsRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    now = utc_now()
+    if req.floor and req.floor != "Wszystkie":
+        cursor.execute("UPDATE rooms SET posX = NULL, posY = NULL, updated_at = ? WHERE floor = ?", (now, req.floor))
+    else:
+        cursor.execute("UPDATE rooms SET posX = NULL, posY = NULL, updated_at = ?", (now,))
+    db.commit()
+    cursor.execute("SELECT * FROM rooms ORDER BY sortOrder ASC, id ASC")
+    rooms = [build_room_representation(r, db) for r in cursor.fetchall()]
+    return {"status": "success", "rooms": rooms}
+
+class ReorderRoomsRequest(BaseModel):
+    roomIds: List[str]
+
+@app.post("/api/v1/admin/rooms/reorder", tags=["Admin"])
+def reorder_rooms(req: ReorderRoomsRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    now = utc_now()
+    for idx, r_id in enumerate(req.roomIds):
+        cursor.execute("UPDATE rooms SET sortOrder = ?, updated_at = ? WHERE id = ?", (idx, now, r_id))
+    db.commit()
+    cursor.execute("SELECT * FROM rooms ORDER BY sortOrder ASC, id ASC")
+    rooms = [build_room_representation(r, db) for r in cursor.fetchall()]
+    return {"status": "success", "rooms": rooms}
+
+@app.get("/api/v1/admin/users", tags=["Admin"])
+def list_users(admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT id, username, display_name, role, room_id, is_active, created_at, updated_at FROM users ORDER BY created_at DESC")
+    return [dict(r) for r in cursor.fetchall()]
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    display_name: str
+    role: str = Field(..., pattern="^(admin|operator)$")
+    room_id: Optional[str] = None
+
+@app.post("/api/v1/admin/users", tags=["Admin"])
+def create_user(req: CreateUserRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM users WHERE username = ?", (req.username.strip(),))
+    if cursor.fetchone():
+        raise DomainException(409, "VALIDATION_ERROR", "Użytkownik o takim loginie już istnieje.")
+
+    user_id = str(uuid.uuid4())
+    now = utc_now()
+    p_hash = hash_password(req.password)
+
+    cursor.execute("""
+        INSERT INTO users (id, username, password_hash, display_name, role, room_id, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+    """, (user_id, req.username.strip(), p_hash, req.display_name, req.role, req.room_id, now, now))
+
+    if req.role == "operator" and req.room_id:
+        cursor.execute("UPDATE rooms SET operator_id = ? WHERE id = ?", (user_id, req.room_id))
+
+    db.commit()
+    log_audit(db, "user", admin["id"], "user_created", "user", user_id, {"username": req.username, "role": req.role})
+    return {"status": "success", "id": user_id, "username": req.username}
+
+class UpdateUserRequest(BaseModel):
+    display_name: Optional[str] = None
+    role: Optional[str] = None
+    room_id: Optional[str] = None
+    is_active: Optional[bool] = None
+    password: Optional[str] = None
+
+@app.patch("/api/v1/admin/users/{user_id}", tags=["Admin"])
+def update_user_admin(user_id: str, req: UpdateUserRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Użytkownik nie istnieje.")
+
+    fields = []
+    values = []
+    if req.display_name is not None:
+        fields.append("display_name = ?")
+        values.append(req.display_name)
+    if req.role is not None:
+        fields.append("role = ?")
+        values.append(req.role)
+    if req.room_id is not None:
+        fields.append("room_id = ?")
+        values.append(req.room_id)
+        cursor.execute("UPDATE rooms SET operator_id = ? WHERE id = ?", (user_id, req.room_id))
+    if req.is_active is not None:
+        fields.append("is_active = ?")
+        values.append(1 if req.is_active else 0)
+    if req.password is not None:
+        fields.append("password_hash = ?")
+        values.append(hash_password(req.password))
+
+    if fields:
+        fields.append("updated_at = ?")
+        values.append(utc_now())
+        values.append(user_id)
+        cursor.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", values)
+        db.commit()
+        log_audit(db, "user", admin["id"], "user_updated", "user", user_id)
+
+    return {"status": "success", "user_id": user_id}
+
+class PasswordResetRequest(BaseModel):
+    new_password: Optional[str] = None
+
+@app.post("/api/v1/admin/users/{user_id}/password-reset", tags=["Admin"])
+def reset_user_password(user_id: str, req: PasswordResetRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Użytkownik nie istnieje.")
+    
+    new_pass = req.new_password.strip() if (req.new_password and req.new_password.strip()) else secrets.token_urlsafe(8)
+    cursor.execute("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?", (hash_password(new_pass), utc_now(), user_id))
+    cursor.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
+    db.commit()
+    log_audit(db, "user", admin["id"], "password_reset", "user", user_id)
+    return {"status": "success", "user_id": user_id, "new_password": new_pass}
+
+# ==============================================================================
+# 6.6 Urządzenia ESP8266
+# ==============================================================================
+class RegisterDeviceRequest(BaseModel):
+    name: str
+    room_id: Optional[str] = None
+
+@app.post("/api/v1/admin/devices", tags=["Devices"])
+def register_device(req: RegisterDeviceRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    raw_token = secrets.token_hex(20)
+    token_h = hash_token(raw_token)
+    device_id = str(uuid.uuid4())
+    now = utc_now()
+
+    cursor = db.cursor()
+    cursor.execute("""
+        INSERT INTO devices (id, name, token_hash, room_id, is_active, last_seen_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 1, NULL, ?, ?)
+    """, (device_id, req.name, token_h, req.room_id, now, now))
+
+    if req.room_id:
+        cursor.execute("UPDATE rooms SET device_id = ? WHERE id = ?", (device_id, req.room_id))
+
+    db.commit()
+    log_audit(db, "user", admin["id"], "device_registered", "device", device_id, {"name": req.name, "room_id": req.room_id})
+
+    return {
+        "status": "success",
+        "device_id": device_id,
+        "name": req.name,
+        "token": raw_token # Only returned once at registration
+    }
+
+@app.get("/api/v1/admin/devices", tags=["Devices"])
+def list_devices(admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT id, name, room_id, is_active, last_seen_at, created_at, updated_at FROM devices")
+    return [dict(r) for r in cursor.fetchall()]
+
+class UpdateDeviceRequest(BaseModel):
+    name: Optional[str] = None
+    room_id: Optional[str] = None
+    is_active: Optional[bool] = None
+
+@app.patch("/api/v1/admin/devices/{device_id}", tags=["Devices"])
+def update_device(device_id: str, req: UpdateDeviceRequest, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM devices WHERE id = ?", (device_id,))
+    dev = cursor.fetchone()
+    if not dev:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Urządzenie nie istnieje.")
+    
+    fields = []
+    params = []
+    if req.name is not None:
+        fields.append("name = ?")
+        params.append(req.name)
+    if req.room_id is not None:
+        fields.append("room_id = ?")
+        params.append(req.room_id)
+        cursor.execute("UPDATE rooms SET device_id = NULL WHERE device_id = ?", (device_id,))
+        if req.room_id:
+            cursor.execute("UPDATE rooms SET device_id = ? WHERE id = ?", (device_id, req.room_id))
+    if req.is_active is not None:
+        fields.append("is_active = ?")
+        params.append(1 if req.is_active else 0)
+    
+    if fields:
+        fields.append("updated_at = ?")
+        params.append(utc_now())
+        params.append(device_id)
+        cursor.execute(f"UPDATE devices SET {', '.join(fields)} WHERE id = ?", params)
+        db.commit()
+    
+    log_audit(db, "user", admin["id"], "device_updated", "device", device_id, req.dict(exclude_unset=True))
+    cursor.execute("SELECT id, name, room_id, is_active, last_seen_at, created_at, updated_at FROM devices WHERE id = ?", (device_id,))
+    return dict(cursor.fetchone())
+
+@app.delete("/api/v1/admin/devices/{device_id}", tags=["Devices"])
+def delete_device(device_id: str, admin: sqlite3.Row = Depends(require_admin), db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM devices WHERE id = ?", (device_id,))
+    dev = cursor.fetchone()
+    if not dev:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Urządzenie nie istnieje.")
+    cursor.execute("UPDATE rooms SET device_id = NULL WHERE device_id = ?", (device_id,))
+    cursor.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+    db.commit()
+    log_audit(db, "user", admin["id"], "device_deleted", "device", device_id, {"name": dev["name"]})
+    return {"status": "success", "message": "Urządzenie zostało usunięte."}
+
+@app.get("/api/v1/device/state", tags=["Devices"])
+def get_device_assigned_room_state(
+    device: sqlite3.Row = Depends(require_device),
+    x_firmware_version: Optional[str] = Header(None),
+    x_chip_type: Optional[str] = Header(None),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    room_id = device["room_id"]
+    if not room_id:
+        raise DomainException(400, "ROOM_NOT_ASSIGNED", "Urządzenie nie ma przypisanej sali.")
+    
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT r.*, 
+               s.id as s_id, s.started_at as s_started_at, s.alert_limit_seconds as s_limit, 
+               s.alert_due_at as s_due_at, s.alert_triggered_at as s_triggered_at
+        FROM rooms r
+        LEFT JOIN occupancy_sessions s ON r.id = s.room_id AND s.ended_at IS NULL
+        WHERE r.id = ?
+    """, (room_id,))
+    r = cursor.fetchone()
+    if not r:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Przypisana sala nie istnieje.")
+
+    session_data = None
+    if r["s_id"]:
+        session_data = format_active_session({
+            "id": r["s_id"],
+            "room_id": r["id"],
+            "started_at": r["s_started_at"],
+            "alert_limit_seconds": r["s_limit"],
+            "alert_due_at": r["s_due_at"],
+            "alert_triggered_at": r["s_triggered_at"]
+        })
+
+    # Update device last_seen_at and metadata
+    dev_name = device["name"].lower()
+    chip = (x_chip_type or ("esp32" if ("cyd" in dev_name or "32" in dev_name) else "esp8266")).lower()
+
+    update_fields = ["last_seen_at = ?", "chip_type = ?"]
+    update_params = [utc_now(), chip]
+    if x_firmware_version:
+        update_fields.append("firmware_version = ?")
+        update_params.append(x_firmware_version)
+    update_params.append(device["id"])
+
+    cursor.execute(f"UPDATE devices SET {', '.join(update_fields)} WHERE id = ?", update_params)
+    db.commit()
+
+    fw_ver = "1.3.6"
+    bin_name = "cyd_firmware.bin" if chip == "esp32" else "esp8266_firmware.bin"
+    bin_path = os.path.join(BASE_DIR, bin_name)
+    has_update = os.path.exists(bin_path)
+    fw_url = f"https://sale.pwojtaszek.codes/api/v1/firmware/download?chip={chip}&v=136"
+
+    return {
+        "device_id": device["id"],
+        "room_id": r["id"],
+        "room_name": r["name"],
+        "status": r["status"],
+        "active_session": session_data,
+        "firmware": {
+            "chip": chip,
+            "version": fw_ver,
+            "has_update": has_update,
+            "url": fw_url
+        }
+    }
+
+@app.post("/api/v1/device/status", tags=["Devices"])
+async def set_device_room_status(
+    req: StatusChangeRequest,
+    device: sqlite3.Row = Depends(require_device),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    room_id = device["room_id"]
+    if not room_id:
+        raise DomainException(400, "ROOM_NOT_ASSIGNED", "Urządzenie nie ma przypisanej sali.")
+
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM rooms WHERE id = ?", (room_id,))
+    room = cursor.fetchone()
+    if not room:
+        raise DomainException(404, "RESOURCE_NOT_FOUND", "Przypisana sala nie istnieje.")
+
+    target_status = req.status
+    current_status = room["status"]
+    now_iso = utc_now()
+    now_dt = parse_iso(now_iso)
+    changed = False
+
+    cursor.execute("SELECT * FROM occupancy_sessions WHERE room_id = ? AND ended_at IS NULL", (room_id,))
+    active_session = cursor.fetchone()
+
+    actor_str = f"device:{device['id']}"
+
+    if current_status == "free" and target_status == "occupied":
+        effective_limit = room["default_alert_limit_seconds"]
+        if not effective_limit:
+            cursor.execute("SELECT value FROM system_settings WHERE key = 'default_alert_limit_seconds'")
+            row = cursor.fetchone()
+            effective_limit = int(row["value"]) if row else 900
+        
+        due_dt = now_dt + timedelta(seconds=effective_limit)
+        due_iso = due_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        session_id = str(uuid.uuid4())
+
+        cursor.execute("""
+            INSERT INTO occupancy_sessions (id, room_id, started_at, ended_at, alert_limit_seconds, alert_due_at, alert_triggered_at, started_by, ended_by)
+            VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, NULL)
+        """, (session_id, room_id, now_iso, effective_limit, due_iso, actor_str))
+
+        cursor.execute("UPDATE rooms SET status = 'occupied', updated_at = ? WHERE id = ?", (now_iso, room_id))
+        changed = True
+
+        cursor.execute("SELECT * FROM occupancy_sessions WHERE id = ?", (session_id,))
+        active_session = cursor.fetchone()
+        log_audit(db, "device", device["id"], "session_started", "room", room_id, {"session_id": session_id})
+
+    elif current_status == "occupied" and target_status == "free":
+        if active_session:
+            cursor.execute("UPDATE occupancy_sessions SET ended_at = ?, ended_by = ? WHERE id = ?", (now_iso, actor_str, active_session["id"]))
+        cursor.execute("UPDATE rooms SET status = 'free', updated_at = ? WHERE id = ?", (now_iso, room_id))
+        changed = True
+        log_audit(db, "device", device["id"], "session_ended", "room", room_id, {"session_id": active_session["id"] if active_session else None})
+        active_session = None
+
+    cursor.execute("UPDATE devices SET last_seen_at = ? WHERE id = ?", (now_iso, device["id"]))
+    db.commit()
+
+    formatted_session = format_active_session(active_session)
+    if changed:
+        await ws_manager.broadcast("room.updated", {
+            "room_id": room_id,
+            "status": target_status,
+            "active_session": formatted_session
+        })
+
+    return {
+        "room_id": room_id,
+        "status": target_status,
+        "changed": changed,
+        "active_session": formatted_session
+    }
+
+@app.post("/api/v1/device/heartbeat", tags=["Devices"])
+def device_heartbeat(device: sqlite3.Row = Depends(require_device), db: sqlite3.Connection = Depends(get_db)):
+    now = utc_now()
+    cursor = db.cursor()
+    cursor.execute("UPDATE devices SET last_seen_at = ? WHERE id = ?", (now, device["id"]))
+    db.commit()
+    return {"status": "ok", "server_time": now}
+
+class DeviceAlertLimitRequest(BaseModel):
+    limit_seconds: Optional[int] = None
+    alert_limit_seconds: Optional[int] = None
+
+@app.post("/api/v1/device/alert-limit", tags=["Devices"])
+@app.patch("/api/v1/device/alert-limit", tags=["Devices"])
+async def device_set_alert_limit(
+    req: DeviceAlertLimitRequest,
+    room_id: Optional[str] = None,
+    device: Optional[sqlite3.Row] = Depends(get_current_device_optional),
+    user: Optional[sqlite3.Row] = Depends(get_current_user_optional),
+    db: sqlite3.Connection = Depends(get_db)
+):
+    target_room_id = room_id
+    if device:
+        target_room_id = device["room_id"]
+    elif user:
+        if not target_room_id:
+            target_room_id = user["room_id"]
+    else:
+        raise DomainException(401, "UNAUTHENTICATED", "Wymagana autoryzacja urządzenia lub użytkownika.")
+
+    if not target_room_id:
+        raise DomainException(400, "ROOM_NOT_ASSIGNED", "Brak przypisanej sali.")
+
+    limit_val = req.limit_seconds or req.alert_limit_seconds
+    if not limit_val or limit_val <= 0:
+        raise DomainException(400, "VALIDATION_ERROR", "Niepoprawna wartość limit_seconds.")
+
+    cursor = db.cursor()
+    now_iso = utc_now()
+    cursor.execute("UPDATE rooms SET default_alert_limit_seconds = ?, updated_at = ? WHERE id = ?", (limit_val, now_iso, target_room_id))
+
+    cursor.execute("SELECT * FROM occupancy_sessions WHERE room_id = ? AND ended_at IS NULL", (target_room_id,))
+    active_session = cursor.fetchone()
+    if active_session:
+        started_dt = parse_iso(active_session["started_at"])
+        due_dt = started_dt + timedelta(seconds=limit_val)
+        due_iso = due_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cursor.execute("UPDATE occupancy_sessions SET alert_limit_seconds = ?, alert_due_at = ? WHERE id = ?", (limit_val, due_iso, active_session["id"]))
+        cursor.execute("SELECT * FROM occupancy_sessions WHERE id = ?", (active_session["id"],))
+        active_session = cursor.fetchone()
+
+    db.commit()
+    formatted = format_active_session(active_session)
+    await ws_manager.broadcast("room.updated", {
+        "room_id": target_room_id,
+        "active_session": formatted
+    })
+    return {"status": "success", "room_id": target_room_id, "default_alert_limit_seconds": limit_val, "active_session": formatted}
+
+# ==============================================================================
+# 6.7 WebSocket na żywo (/api/v1/ws)
+# ==============================================================================
+@app.websocket("/api/v1/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, listen for ping/pong or client messages
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong", "time": utc_now()}))
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception:
+        ws_manager.disconnect(websocket)
+
+# ==============================================================================
+# System, Health & OTA App Updates
+# ==============================================================================
+@app.get("/api/v1/health", tags=["System"])
+@app.get("/api/health", tags=["System"])
+@app.get("/api/server-info", tags=["System"])
+def health():
+    lan_ip = get_primary_lan_ip()
+    return {
+        "status": "ok",
+        "service": "DostepnoscSal-FastAPI",
+        "contract_version": "0.1",
+        "time": utc_now(),
+        "lanIp": lan_ip,
+        "lanUrl": f"http://{lan_ip}:{PORT}"
+    }
+
+@app.get("/api/service-info", tags=["System"])
+def get_service_info(db: sqlite3.Connection = Depends(get_db)):
+    cursor = db.cursor()
+    cursor.execute("SELECT COUNT(*) FROM rooms")
+    total_rooms = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM rooms WHERE status = 'free'")
+    free_rooms = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM rooms WHERE status = 'occupied'")
+    occupied_rooms = cursor.fetchone()[0]
+
+    db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+    db_size_formatted = f"{db_size / 1024:.1f} KB" if db_size < 1048576 else f"{db_size / 1048576:.2f} MB"
+
+    uptime_sec = int((datetime.now(timezone.utc) - SERVER_START_TIME).total_seconds())
+    mins, sec = divmod(uptime_sec, 60)
+    hours, mins = divmod(mins, 60)
+    uptime_human = f"{hours}h {mins}m {sec}s" if hours > 0 else f"{mins}m {sec}s"
+
+    return {
+        "status": "ok",
+        "service": "DostepnoscSal-FastAPI",
+        "contract_version": "0.1",
+        "uptime_human": uptime_human,
+        "uptime_seconds": uptime_sec,
+        "server_os": platform.platform(),
+        "python_version": platform.python_version(),
+        "sqlite_version": sqlite3.sqlite_version,
+        "database": {
+            "path": DB_PATH,
+            "size_formatted": db_size_formatted,
+            "total_rooms": total_rooms,
+            "free_rooms": free_rooms,
+            "occupied_rooms": occupied_rooms,
+        },
+        "traffic_metrics": {
+            "total_requests": 150,
+            "file_downloads": 1,
+        }
+    }
+
+def _find_apk_file() -> str:
+    """Find the latest (newest + largest) APK file from all candidate locations."""
+    candidates = [
+        os.path.join(BASE_DIR,       "DostepnoscSal.apk"),         # server/ — always updated by deploy_apk.py
+        os.path.join(PROJECT_ROOT,   "DostepnoscSal.apk"),
+        os.path.join(PROJECT_ROOT,   "build", "app", "outputs", "flutter-apk", "app-release.apk"),
+        os.path.join(PROJECT_ROOT,   "build", "web", "DostepnoscSal.apk"),
+    ]
+    best = None
+    best_mtime = 0
+    for p in candidates:
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 10_000_000:
+                mtime = os.path.getmtime(p)
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best = p
+        except OSError:
+            pass
+    return best or os.path.join(BASE_DIR, "DostepnoscSal.apk")
+
+@app.get("/api/app-version", tags=["System"])
+@app.get("/api/v1/app-version", tags=["System"])
+def get_app_version():
+    apk_path = _find_apk_file()
+    apk_size_actual = os.path.getsize(apk_path) if os.path.exists(apk_path) else 0
+
+    # Load version metadata from file (written by deploy_apk.py after each build)
+    ver = _load_app_version()
+    version_code = ver.get("versionCode", 7)
+    version_name = ver.get("versionName", "1.0.0")
+    release_notes = ver.get("releaseNotes", "Nowa wersja jest dostępna.")
+    # Prefer stored apkSize (exact), fallback to measured file size
+    apk_size = ver.get("apkSize") or apk_size_actual
+    # Prefer stored URL (has cache-buster param), otherwise build it
+    apk_url = ver.get("apkUrl") or f"https://sale.pwojtaszek.codes/DostepnoscSal.apk?v={version_code}"
+
+    return JSONResponse(
+        content={
+            "versionCode": version_code,
+            "versionName": version_name,
+            "apkUrl": apk_url,
+            "apkSize": apk_size,
+            "releaseNotes": release_notes,
+        },
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+    )
+
+@app.get("/DostepnoscSal.apk", tags=["System"])
+@app.get("/dostepnoscsal.apk", tags=["System"])
+def download_apk():
+    """Download the latest APK (always newest build, bypasses Cloudflare cache via ?v=N query param)."""
+    apk_path = _find_apk_file()
+    if os.path.exists(apk_path):
+        return FileResponse(
+            apk_path,
+            filename="DostepnoscSal.apk",
+            media_type="application/vnd.android.package-archive",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+        )
+    raise HTTPException(status_code=404, detail="Plik APK nie został jeszcze zbudowany.")
+
+@app.get("/DostepnoscSal_v{version}.apk", tags=["System"])
+def download_apk_versioned(version: str):
+    """Download versioned APK — always redirects to the latest build."""
+    apk_path = _find_apk_file()
+    if os.path.exists(apk_path):
+        return FileResponse(
+            apk_path,
+            filename=f"DostepnoscSal_v{version}.apk",
+            media_type="application/vnd.android.package-archive",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+        )
+    raise HTTPException(status_code=404, detail="Plik APK nie został jeszcze zbudowany.")
+
+def _get_firmware_file(chip: str) -> str:
+    c = chip.lower()
+    if "8266" in c or "wemos" in c:
+        return os.path.join(BASE_DIR, "esp8266_firmware.bin")
+    return os.path.join(BASE_DIR, "cyd_firmware.bin")
+
+@app.get("/api/v1/firmware/version", tags=["Firmware"])
+@app.get("/api/v1/cyd-version", tags=["Firmware"])
+@app.get("/api/v1/esp8266-version", tags=["Firmware"])
+def get_firmware_version(chip: str = "esp32"):
+    fw_path = _get_firmware_file(chip)
+    fw_size = os.path.getsize(fw_path) if os.path.exists(fw_path) else 0
+    norm_chip = "esp8266" if "8266" in chip.lower() else "esp32"
+    version = "1.3.6"
+    version_tag = version.replace(".", "")
+    return JSONResponse(
+        content={
+            "chip": norm_chip,
+            "version": version,
+            "has_update": os.path.exists(fw_path),
+            "firmware_url": f"https://sale.pwojtaszek.codes/api/v1/firmware/download?chip={norm_chip}&v={version_tag}",
+            "firmware_size": fw_size,
+            "release_notes": "Wersja 1.3.6: Automatyczne odswiezanie listy wolnych sal co 5 sekund (bez koniecznosci recznego klikania Odswiez)."
+        },
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+    )
+
+@app.get("/api/v1/firmware/download", tags=["Firmware"])
+@app.get("/api/v1/cyd-firmware.bin", tags=["Firmware"])
+@app.get("/api/v1/esp8266-firmware.bin", tags=["Firmware"])
+def download_firmware(chip: str = "esp32"):
+    fw_path = _get_firmware_file(chip)
+    filename = os.path.basename(fw_path)
+    if os.path.exists(fw_path):
+        return FileResponse(
+            fw_path,
+            filename=filename,
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+        )
+    raise HTTPException(status_code=404, detail="Brak pliku oprogramowania firmware dla tego układu.")
+
+# Static Web SPA serving (fallback for frontend build)
+@app.get("/{full_path:path}", include_in_schema=False)
+def serve_web_spa(full_path: str):
+    no_cache_headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+    target = os.path.join(WEB_DIR, full_path)
+    if os.path.isfile(target):
+        return FileResponse(target, headers=no_cache_headers)
+    index_path = os.path.join(WEB_DIR, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path, headers=no_cache_headers)
+    return {"message": "DostępnośćSal API działa. Otwórz /docs aby zobaczyć dokumentację Swagger."}
+
+# UDP Broadcast Beacon for local network discovery (Port 8082)
+def start_udp_beacon():
+    def worker():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", 8082))
+            while True:
+                data, addr = sock.recvfrom(1024)
+                msg = data.decode("utf-8", errors="ignore").strip()
+                if "DISCOVER" in msg or "ROOM_SERVER" in msg:
+                    lan_ip = get_primary_lan_ip()
+                    reply = json.dumps({
+                        "type": "ROOM_SERVER_ANNOUNCEMENT",
+                        "lanIp": lan_ip,
+                        "port": PORT,
+                        "lanUrl": f"http://{lan_ip}:{PORT}"
+                    })
+                    sock.sendto(reply.encode("utf-8"), addr)
+        except Exception as e:
+            sys.stderr.write(f"[UDP Beacon] Error: {e}\n")
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+if __name__ == "__main__":
+    init_db()
+    start_udp_beacon()
+    print("==================================================================")
+    print(" Dostępność Sal - FastAPI Backend Server (Kontrakt v0.1)")
+    print(f" Port: {PORT}")
+    print(f" Baza SQLite: {DB_PATH}")
+    print(f" Swagger UI: http://localhost:{PORT}/docs")
+    print(f" OpenAPI JSON: http://localhost:{PORT}/api/v1/openapi.json")
+    print(f" Adres lokalny: http://localhost:{PORT}")
+    print("==================================================================")
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

@@ -1,0 +1,11 @@
+tunnel: b3ecea77-5b0d-460d-88d6-28e570d05421
+credentials-file: C:\Users\Victus\.cloudflared\b3ecea77-5b0d-460d-88d6-28e570d05421.json
+
+ingress:
+  - hostname: sale.pwojtaszek.codes
+    service: http://localhost:8081
+  - hostname: gra.pwojtaszek.codes
+    service: http://localhost:8080
+  - hostname: gra.pwojtaszek.5g.in
+    service: http://localhost:8080
+  - service: http_status:404

@@ -1,0 +1,7 @@
+{
+  "versionCode": 10,
+  "versionName": "1.3.5",
+  "apkSize": 55403493,
+  "apkUrl": "https://sale.pwojtaszek.codes/DostepnoscSal.apk?v=10",
+  "releaseNotes": "Wersja 1.3.5: Naprawione natychmiastowe odswiezanie z ESP - aplikacja teraz czyta dane bezposrednio z serwera (nie z lokalnej bazy), wiec zmiana z ESP jest widoczna od razu."
+}
