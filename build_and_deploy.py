@@ -43,7 +43,7 @@ ANDROID_SDK = os.environ.get(
 
 def run(cmd, cwd=None):
     print(f"\n>>> {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd or PROJECT_ROOT)
+    result = subprocess.run(cmd, cwd=cwd or PROJECT_ROOT, shell=True)
     if result.returncode != 0:
         print(f"[build] BŁĄD: Komenda zakończona z kodem {result.returncode}")
         sys.exit(result.returncode)

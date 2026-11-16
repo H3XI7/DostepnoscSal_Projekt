@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../models/room_model.dart';
 import '../services/room_database_helper.dart';
@@ -44,9 +45,51 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
     );
   }
 
+  static const String _prefSelectedFloor = 'room_main_selected_floor';
+  static const String _prefCurrentViewIndex = 'room_main_current_view_index';
+  static const String _prefStatusFilter = 'room_main_status_filter';
+
+  Future<void> _loadSavedState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedFloor = prefs.getString(_prefSelectedFloor);
+      final savedViewIndex = prefs.getInt(_prefCurrentViewIndex);
+      final savedStatusFilter = prefs.getString(_prefStatusFilter);
+
+      if (mounted) {
+        setState(() {
+          if (savedFloor != null && (_floors.contains(savedFloor) || savedFloor == 'Wszystkie')) {
+            _selectedFloor = savedFloor;
+          }
+          if (savedViewIndex != null && (savedViewIndex == 0 || savedViewIndex == 1)) {
+            _currentViewIndex = savedViewIndex;
+          }
+          if (savedStatusFilter != null && ['Wszystkie', 'Wolne', 'Zajęte'].contains(savedStatusFilter)) {
+            _statusFilter = savedStatusFilter;
+          }
+        });
+        _loadRooms();
+      }
+    } catch (e) {
+      debugPrint('[RoomMainScreen] Error loading saved state: $e');
+    }
+  }
+
+  Future<void> _saveCurrentState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefSelectedFloor, _selectedFloor);
+      await prefs.setInt(_prefCurrentViewIndex, _currentViewIndex);
+      await prefs.setString(_prefStatusFilter, _statusFilter);
+    } catch (e) {
+      debugPrint('[RoomMainScreen] Error saving state: $e');
+    }
+  }
+
   @override
   void initState() {
     super.initState();
+    _loadSavedState();
     _loadRooms();
 
     // WebSocket: instant updates when ESP changes room status
@@ -1270,6 +1313,7 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
                     setState(() {
                       _currentViewIndex = set.first;
                     });
+                    _saveCurrentState();
                     _loadRooms();
                   },
                 ),
@@ -1391,6 +1435,7 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
         onSelected: (selected) {
           if (selected) {
             setState(() => _selectedFloor = floorName);
+            _saveCurrentState();
             _loadRooms();
           }
         },
@@ -1852,6 +1897,7 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
       ),
       onSelected: (_) {
         setState(() => _statusFilter = label);
+        _saveCurrentState();
         _loadRooms();
       },
     );
