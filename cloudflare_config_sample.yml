@@ -1,5 +1,5 @@
 tunnel: b3ecea77-5b0d-460d-88d6-28e570d05421
-credentials-file: C:\Users\Victus\.cloudflared\b3ecea77-5b0d-460d-88d6-28e570d05421.json
+credentials-file: .cloudflared\b3ecea77-5b0d-460d-88d6-28e570d05421.json
 
 ingress:
   - hostname: sale.pwojtaszek.codes

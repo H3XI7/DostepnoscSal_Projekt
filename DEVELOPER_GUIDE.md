@@ -101,10 +101,10 @@ Jeśli chcesz uruchomić tunel internetowy Cloudflare na nowym komputerze:
    ```bash
    cloudflared tunnel create sale-serwer
    ```
-3. Skonfiguruj plik `~/.cloudflared/config.yml` wzorując się na dołączonym w projekcie [cloudflare_config_sample.yml](file:///C:/Users/Victus/Desktop/DostepnoscSal_Projekt/cloudflare_config_sample.yml):
+3. Skonfiguruj plik `~/.cloudflared/config.yml` wzorując się na dołączonym w projekcie `cloudflare_config_sample.yml`:
    ```yaml
    tunnel: <TWÓJ-UUID-TUNELU>
-   credentials-file: C:\Users\<Nazwa>\.cloudflared\<TWÓJ-UUID-TUNELU>.json
+   credentials-file: ~/.cloudflared/<TWÓJ-UUID-TUNELU>.json
 
    ingress:
      - hostname: sale.twojadomena.pl

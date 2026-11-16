@@ -37,7 +37,10 @@ PUBSPEC      = os.path.join(PROJECT_ROOT, "pubspec.yaml")
 
 ANDROID_SDK = os.environ.get(
     "ANDROID_HOME",
-    os.path.expanduser(r"C:\Users\Victus\AppData\Local\Android\Sdk")
+    os.environ.get(
+        "ANDROID_SDK_ROOT",
+        os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Android", "Sdk")
+    )
 )
 
 

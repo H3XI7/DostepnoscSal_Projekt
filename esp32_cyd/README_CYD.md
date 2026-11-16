@@ -62,7 +62,7 @@ Plik w folderze `Dokumenty/Arduino/libraries/TFT_eSPI/User_Setup.h` został już
 1. Dokonaj zmian w kodzie `esp32_cyd.ino` i zwiększ stałą `CYD_FIRMWARE_VERSION` (np. na `"1.3.1"`).
 2. Skompiluj binarkę:
    ```powershell
-   & "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --export-binaries --fqbn "esp32:esp32:esp32:PartitionScheme=min_spiffs" "C:\Users\Victus\Desktop\DostepnoscSal_Projekt\esp32_cyd\esp32_cyd.ino"
+   arduino-cli compile --export-binaries --fqbn "esp32:esp32:esp32:PartitionScheme=min_spiffs" "esp32_cyd\esp32_cyd.ino"
    ```
 3. Skopiuj wygenerowany plik `esp32_cyd\build\esp32.esp32.esp32\esp32_cyd.ino.bin` do `server\cyd_firmware.bin`.
 4. Zmień wersję w `sync_server.py` (`"version": "1.3.1"`).
