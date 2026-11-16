@@ -12,6 +12,7 @@ class InteractiveFloorMap extends StatefulWidget {
   final VoidCallback? onToggleEditMode;
   final bool showEditToolbar;
   final bool enableViewer;
+  final double controlsBottomOffset;
 
   const InteractiveFloorMap({
     super.key,
@@ -25,6 +26,7 @@ class InteractiveFloorMap extends StatefulWidget {
     this.onToggleEditMode,
     this.showEditToolbar = false,
     this.enableViewer = true,
+    this.controlsBottomOffset = 12,
   });
 
   @override
@@ -467,7 +469,7 @@ class _InteractiveFloorMapState extends State<InteractiveFloorMap> {
           // Floating Zoom & Fit Controls
           Positioned(
             right: 12,
-            bottom: 12,
+            bottom: widget.controlsBottomOffset,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
               decoration: BoxDecoration(

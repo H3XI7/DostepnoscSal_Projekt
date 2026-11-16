@@ -1518,7 +1518,7 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
                 ),
                 const SizedBox(width: 16),
                 Expanded(
-                  child: _buildFloorCard('Piętro', 'POZIOM +1 (I PIĘTRO)', Colors.orangeAccent),
+                  child: _buildFloorCard('Piętro', 'POZIOM +1 (I PIĘTRO)', Colors.orangeAccent, controlsBottomOffset: 80),
                 ),
               ],
             ),
@@ -1526,12 +1526,12 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
         } else {
           // Stacked scrollable for narrow/mobile screens
           return SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 88),
             child: Column(
               children: [
                 _buildFloorCard('Parter', 'POZIOM 0 (PARTER)', Colors.cyanAccent, fixedHeight: 560),
                 const SizedBox(height: 16),
-                _buildFloorCard('Piętro', 'POZIOM +1 (I PIĘTRO)', Colors.orangeAccent, fixedHeight: 560),
+                _buildFloorCard('Piętro', 'POZIOM +1 (I PIĘTRO)', Colors.orangeAccent, fixedHeight: 560, controlsBottomOffset: 80),
               ],
             ),
           );
@@ -1540,7 +1540,7 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
     );
   }
 
-  Widget _buildFloorCard(String floor, String title, Color accentColor, {double? fixedHeight}) {
+  Widget _buildFloorCard(String floor, String title, Color accentColor, {double? fixedHeight, double controlsBottomOffset = 12}) {
     final floorRooms = _rooms.where((r) => r.floor == floor || (floor == 'Parter' && r.floor == 'Garaż podziemny')).toList();
     final free = floorRooms.where((r) => r.isAvailable).length;
 
@@ -1575,6 +1575,7 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
             rooms: _rooms,
             isEditMode: _isEditMode,
             showEditToolbar: false,
+            controlsBottomOffset: controlsBottomOffset,
             onRoomTap: (room) {
               showRoomDetailSheet(
                 context: context,
@@ -1630,6 +1631,7 @@ class _RoomMainScreenState extends State<RoomMainScreen> {
       rooms: _rooms,
       isEditMode: _isEditMode,
       showEditToolbar: false,
+      controlsBottomOffset: 80,
       onRoomTap: (room) {
         showRoomDetailSheet(
           context: context,
